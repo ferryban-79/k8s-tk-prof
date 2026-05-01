@@ -42,9 +42,9 @@ CONFIG = {
     "video_concurrency":      10,
     "comment_concurrency":    8,
     "max_comments_limit":     10000,
-    "rclone_remote":          "vfx",
+    "rclone_remote":          "megapool",  # ← UPDATED: unified pool (rclone union)
     "upload_concurrency":     1,    # ← FIX: 1 per pod × 15 pods × 2 transfers = 30 ≤ 32 Mega ceiling
-    "hard_link_limit":        1700,
+    "hard_link_limit":        99999,  # ← UPDATED: no artificial cap — handle all links
 }
 
 _upload_sem: asyncio.Semaphore = None
@@ -57,6 +57,53 @@ TRACKING_FILE  = f"tracking_report{_suffix}.txt"
 COMPLETED_FILE = f"completed{_suffix}.txt"
 FAILED_FILE    = f"failed{_suffix}.txt"
 LOG_FILE       = f"scraper_log{_suffix}.txt"
+
+# ---------------------------------------------------------
+# 2b. SQLite Master Index — persistent across sessions
+#     Stored locally during run, then uploaded to Mega _Reports/
+#     Use find.py locally to search any post/session/failed
+# ---------------------------------------------------------
+import sqlite3 as _sqlite3
+
+_INDEX_DB = "index.db"
+
+def _init_index():
+    db = _sqlite3.connect(_INDEX_DB)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            tiktok_url  TEXT PRIMARY KEY,
+            tiktok_id   TEXT,
+            author      TEXT,
+            batch_id    TEXT,
+            account_id  TEXT,
+            mega_path   TEXT,
+            sub_dir     TEXT,
+            status      TEXT DEFAULT 'done',
+            chunk_index INTEGER,
+            uploaded_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
+        )
+    """)
+    db.commit()
+    db.close()
+
+_init_index()
+
+def _index_write(tiktok_url, tiktok_id, author, batch_id,
+                 account_id, mega_path, sub_dir, status="done"):
+    """Upload ke baad index.db mein record likho — silently fail karo agar error ho."""
+    try:
+        db = _sqlite3.connect(_INDEX_DB)
+        db.execute("""
+            INSERT OR REPLACE INTO files
+              (tiktok_url, tiktok_id, author, batch_id, account_id,
+               mega_path, sub_dir, status, chunk_index)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (tiktok_url, tiktok_id, author, batch_id, account_id,
+              mega_path, sub_dir, status, CHUNK_INDEX))
+        db.commit()
+        db.close()
+    except Exception:
+        pass  # index failure scraper ko nahi rokna chahiye
 
 def _append_tracking(status: str, url: str, note: str = ""):
     ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -270,13 +317,14 @@ def download_with_ytdlp(url, output_path):
 # FIX: Returns True/False so scrape_video can decide pass/fail.
 #      A link is only marked SUCCESS when Mega confirms receipt.
 # ---------------------------------------------------------
-async def upload_to_mega(local_folder_path, folder_name, log_prefix, sub_dir=""):
+async def upload_to_mega(local_folder_path, folder_name, log_prefix, sub_dir="",
+                         tiktok_url="", tiktok_id="", author=""):
     global _upload_sem
     sem = _upload_sem or asyncio.Semaphore(CONFIG["upload_concurrency"])
     async with sem:
         try:
             # ── CHANGE 1: sub_dir injected into remote path ──
-            # Result: vfx:/Batch--xxx/accountname/posts/@author_slug_id/
+            # Result: megapool:/Batch--xxx/accountname/posts/@author_slug_id/
             if sub_dir:
                 remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/{sub_dir}/{folder_name}"
             else:
@@ -301,16 +349,39 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix, sub_dir="")
             _, stderr = await proc.communicate()
             if proc.returncode == 0:
                 logger.success(f"{log_prefix} 🚀 Mega Upload Done!")
-                return True   # ← FIX: signal success to caller — local data kept, no deletion
+                # ── INDEX: record successful upload ──
+                _index_write(
+                    tiktok_url=tiktok_url,
+                    tiktok_id=tiktok_id,
+                    author=author,
+                    batch_id=BATCH_FOLDER_NAME,
+                    account_id=CONFIG["rclone_remote"],
+                    mega_path=f"{BATCH_FOLDER_NAME}/{sub_dir}/{folder_name}" if sub_dir
+                              else f"{BATCH_FOLDER_NAME}/{folder_name}",
+                    sub_dir=sub_dir,
+                    status="done"
+                )
+                return True
             else:
                 logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
-                return False  # ← FIX: signal failure — link stays in failed.txt
+                # ── INDEX: record failed upload ──
+                _index_write(
+                    tiktok_url=tiktok_url,
+                    tiktok_id=tiktok_id,
+                    author=author,
+                    batch_id=BATCH_FOLDER_NAME,
+                    account_id=CONFIG["rclone_remote"],
+                    mega_path="",
+                    sub_dir=sub_dir,
+                    status="failed"
+                )
+                return False
         except Exception as e:
             logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
             return False
 
 async def upload_report_files():
-    for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]:
+    for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE, _INDEX_DB]:  # ← index.db added
         if not os.path.exists(fpath):
             continue
         try:
@@ -601,7 +672,8 @@ class TikTokScraperV5:
         # ── 4. UPLOAD + TRACK ─────────────────────────────────────────────────
         # CHECKPOINT 5: Mega upload — only SUCCESS when Mega confirms
         # ── CHANGE 4: sub_dir passed to upload_to_mega ──
-        upload_ok = await upload_to_mega(v_path, folder_name, log_prefix, sub_dir)
+        upload_ok = await upload_to_mega(v_path, folder_name, log_prefix, sub_dir,
+                                         tiktok_url=url, tiktok_id=v_id, author=author)
 
         if not upload_ok:
             fail_parts = []
